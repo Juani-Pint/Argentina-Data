@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Panel económico 🇦🇷</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  /* Diseño 1: simple y minimalista */
+  :root{--bg:#f4f4f4;--card:#fff;--accent:#00695c;--muted:#666}
+  body{font-family: "Segoe UI", Roboto, Arial, sans-serif; margin:0; background:var(--bg); color:#222;}
+  .wrap{max-width:720px;margin:14px auto;padding:12px;}
+  header{display:flex;align-items:center;gap:12px}
+  h1{color:var(--accent);font-size:1.4rem;margin:0}
+  .grid{display:grid;grid-template-columns:1fr;gap:12px;margin-top:12px}
+  @media(min-width:680px){ .grid{grid-template-columns:repeat(2,1fr)} }
+  .card{background:var(--card);border-radius:10px;padding:12px;box-shadow:0 2px 6px rgba(0,0,0,0.06)}
+  .label{font-weight:700;color:var(--accent)}
+  .value{font-size:1.2rem;margin-top:6px}
+  .small{font-size:0.9rem;color:var(--muted);margin-top:6px}
+  .muted{color:var(--muted)}
+  #lastUpdate{ text-align:center; margin-top:10px; color:var(--muted); font-size:0.85rem }
+  .green{color: #137a3c}
+  .red{color: #b00020}
+  canvas{width:100% !important; height:220px !important}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Panel económico — prueba</h1>
+    </header>
+
+    <div class="grid">
+      <div class="card">
+        <div class="label">💵 Dólar Oficial</div>
+        <div class="value" id="oficialValor">Cargando…</div>
+        <div class="small" id="oficialVar">Variación: — | Día anterior: —</div>
+      </div>
+
+      <div class="card">
+        <div class="label">💸 Dólar Blue</div>
+        <div class="value" id="blueValor">Cargando…</div>
+        <div class="small" id="blueVar">Variación: — | Día anterior: —</div>
+      </div>
+
+      <div class="card">
+        <div class="label">🏦 S&P Merval</div>
+        <div class="value" id="mervalValor">Cargando…</div>
+        <div class="small" id="mervalVar">Variación: — | Día anterior: —</div>
+      </div>
+
+      <div class="card">
+        <div class="label">📈 Riesgo País</div>
+        <div class="value" id="riesgoValor">Cargando…</div>
+        <div class="small" id="riesgoVar">Variación: — | Día anterior: —</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <div class="label">📊 Histórico Dólar Blue (Bluelytics, últimos 15 días)</div>
+      <canvas id="chartBlue"></canvas>
+    </div>
+
+    <div id="lastUpdate">Última actualización: —</div>
+  </div>
+
+<script>
+/*
+ Fuentes usadas:
+ - Bluelytics: https://api.bluelytics.com.ar/v2/latest  (valor actual)
+ - Bluelytics histórico: https://api.bluelytics.com.ar/v2/evolution.json
+ - DolarAPI: https://dolarapi.com/v1/dolares  (dólares varios, índices/riesgo vía endpoints públicos)
+   - índice / riesgo: https://dolarapi.com/v1/otros/indices  y https://dolarapi.com/v1/otros/riesgo_pais
+ Nota: estas APIs suelen permitir fetch desde el navegador. Si alguna devuelve CORS error,
+       hay que usar un pequeño proxy o subir la página a hosting (muchos hosts aceptan estas APIs).
+*/
+
+/* ---------- Helpers ---------- */
+const $ = id => document.getElementById(id);
+const fmt = v => (typeof v === 'number') ? v.toLocaleString('es-AR', {maximumFractionDigits:2}) : v;
+const pct = (diff) => (diff === null || isNaN(diff)) ? '—' : (diff>0? '+' : '') + diff.toFixed(2) + '%';
+function colorizePctElem(elem, num){
+  elem.classList.remove('green','red');
+  if (num==null || isNaN(num)) return;
+  elem.classList.add(num>=0 ? 'green' : 'red');
+}
+
+/* Guardar / leer prev values en localStorage para calcular cambios entre cargas
+   Cada métrica almacena {value: number, ts: timestamp-ms, dateStr: 'YYYY-MM-DD'}
+*/
+function storePrev(key, value){
+  const payload = { value: Number(value), ts: Date.now(), date: new Date().toISOString().slice(0,10) };
+  try{ localStorage.setItem('prev_'+key, JSON.stringify(payload)); }catch(e){}
+}
+function readPrev(key){
+  try{ const d = JSON.parse(localStorage.getItem('prev_'+key)); return d || null; } catch(e){ return null; }
+}
+
+/* Calcular variaciones:
+   - vsPrev: compara con ultimo guardado (puede ser hace minutos/hours)
+   - vsDay: si hay registro con date != today, lo usa como "día anterior"
+*/
+function computeChanges(key, current){
+  const prev = readPrev(key);
+  let vsPrev = null;
+  let vsDay = null;
+
+  if (prev && typeof prev.value === 'number' && prev.value !== 0){
+    vsPrev = (current - prev.value)/prev.value*100;
+  }
+
+  // Buscar en storage un registro con date distinta a hoy (día anterior)
+  try{
+    // intentamos leer un histórico simple: prev_{key}_hist (array de entradas)
+    const histRaw = localStorage.getItem('hist_'+key);
+    const hist = histRaw ? JSON.parse(histRaw) : [];
+    // mantenemos hist con max 30 entradas
+    const today = new Date().toISOString().slice(0,10);
+    // si hist vacío, añadimos prev si existe
+    if (prev && (!hist.length || hist[hist.length-1].ts !== prev.ts)) hist.push(prev);
+    // si el último hist tiene date != today, es el cierre de un día previo
+    const dayBeforeEntry = hist.slice().reverse().find(e => e && e.date && e.date !== today);
+    if (dayBeforeEntry && dayBeforeEntry.value !== 0){
+      vsDay = (current - dayBeforeEntry.value)/dayBeforeEntry.value*100;
+    }
+    // actualizar hist: agregar current snapshot como 'now' (no duplicar por ts)
+    const snap = { value: Number(current), ts: Date.now(), date: new Date().toISOString().slice(0,10) };
+    if (!hist.length || hist[hist.length-1].ts !== snap.ts) hist.push(snap);
+    // recortar a 60 entradas y guardar
+    if (hist.length>60) hist.splice(0, hist.length-60);
+    localStorage.setItem('hist_'+key, JSON.stringify(hist));
+  }catch(e){
+    console.warn('hist storage failed', e);
+  }
+
+  // siempre actualizar prev_{key} con current
+  storePrev(key, current);
+  return { vsPrev, vsDay };
+}
+
+/* ---------- Fetch y render ---------- */
+
+let chartBlue = null;
+async function actualizarTodo(){
+  try{
+    // 1) DÓLARES: Bluelytics para blue/oficial
+    const [bluelyticsRes, dolaresRes] = await Promise.all([
+      fetch('https://api.bluelytics.com.ar/v2/latest'),
+      fetch('https://dolarapi.com/v1/dolares')   // como respaldo para otros "casos"
+    ]);
+
+    const bluelytics = await bluelyticsRes.json().catch(()=>null);
+    const dolaresList = await dolaresRes.json().catch(()=>null);
+
+    // Bluelytics structure: { oficial: {value_buy,value_sell}, blue: {...} }
+    if (bluelytics && bluelytics.oficial && bluelytics.blue){
+      const ofBuy = Number(bluelytics.oficial.value_buy);
+      const ofSell = Number(bluelytics.oficial.value_sell);
+      const blBuy = Number(bluelytics.blue.value_buy);
+      const blSell = Number(bluelytics.blue.value_sell);
+
+      $('oficialValor').textContent = `Compra: $${fmt(ofBuy)} | Venta: $${fmt(ofSell)}`;
+      $('blueValor').textContent = `Compra: $${fmt(blBuy)} | Venta: $${fmt(blSell)}`;
+
+      // Variaciones: vsPrev (última carga) y vsDay (día anterior) usando Bluelytics histórico
+      // Para oficial y blue usamos la venta como referencia para percent
+      const ofChanges = computeChanges('oficial', ofSell);
+      const blChanges = computeChanges('blue', blSell);
+
+      $('oficialVar').textContent = `Variación vs prev: ${pct(ofChanges.vsPrev || null)} | Día anterior: ${pct(ofChanges.vsDay || null)}`;
+      $('blueVar').textContent = `Variación vs prev: ${pct(blChanges.vsPrev || null)} | Día anterior: ${pct(blChanges.vsDay || null)}`;
+      colorizePctElem($('oficialVar'), ofChanges.vsPrev);
+      colorizePctElem($('blueVar'), blChanges.vsPrev);
+    } else if (dolaresList) {
+      // fallback por si Bluelytics no responde
+      const oficial = dolaresList.find(d=>d.casa==='oficial') || {};
+      const blue = dolaresList.find(d=>d.casa==='blue') || {};
+      $('oficialValor').textContent = oficial.venta ? `Compra: $${fmt(oficial.compra)} | Venta: $${fmt(oficial.venta)}` : 'No disponible';
+      $('blueValor').textContent = blue.venta ? `Compra: $${fmt(blue.compra)} | Venta: $${fmt(blue.venta)}` : 'No disponible';
+      if (oficial.venta) {
+        const ofChanges = computeChanges('oficial', Number(oficial.venta));
+        $('oficialVar').textContent = `Variación vs prev: ${pct(ofChanges.vsPrev || null)} | Día anterior: ${pct(ofChanges.vsDay || null)}`;
+        colorizePctElem($('oficialVar'), ofChanges.vsPrev);
+      }
+      if (blue.venta) {
+        const blChanges = computeChanges('blue', Number(blue.venta));
+        $('blueVar').textContent = `Variación vs prev: ${pct(blChanges.vsPrev || null)} | Día anterior: ${pct(blChanges.vsDay || null)}`;
+        colorizePctElem($('blueVar'), blChanges.vsPrev);
+      }
+    }
+
+    // 2) MERVAL y RIESGO: intentamos con DolarAPI (endpoints públicos)
+    // Merval: https://dolarapi.com/v1/otros/indices  -> buscar elemento que contenga 'merval'
+    // Riesgo: https://dolarapi.com/v1/otros/riesgo_pais
+    let mervalValue = null, riesgoValue = null;
+    try{
+      const [resIndices, resRiesgo] = await Promise.all([
+        fetch('https://dolarapi.com/v1/otros/indices'),
+        fetch('https://dolarapi.com/v1/otros/riesgo_pais')
+      ]);
+      const indices = await resIndices.json().catch(()=>null);
+      const riesgo = await resRiesgo.json().catch(()=>null);
+      if (indices && Array.isArray(indices)){
+        const m = indices.find(i => i.nombre && i.nombre.toLowerCase().includes('merval'));
+        if (m && (m.valor !== undefined)) {
+          mervalValue = Number(m.valor);
+        }
+      }
+      if (riesgo && (riesgo.valor !== undefined)) riesgoValue = Number(riesgo.valor);
+    }catch(e){
+      console.warn('no se pudo traer indices/risgo desde dolarapi', e);
+    }
+
+    // Mostrar Merval
+    if (mervalValue !== null){
+      $('mervalValor').textContent = fmt(mervalValue) + ' puntos';
+      const mChanges = computeChanges('merval', mervalValue);
+      $('mervalVar').textContent = `Variación vs prev: ${pct(mChanges.vsPrev || null)} | Día anterior: ${pct(mChanges.vsDay || null)}`;
+      colorizePctElem($('mervalVar'), mChanges.vsPrev);
+    } else {
+      $('mervalValor').textContent = 'No disponible';
+      $('mervalVar').textContent = 'Variación: — | Día anterior: —';
+    }
+
+    // Mostrar Riesgo País
+    if (riesgoValue !== null){
+      $('riesgoValor').textContent = fmt(riesgoValue);
+      const rChanges = computeChanges('riesgo', riesgoValue);
+      $('riesgoVar').textContent = `Variación vs prev: ${pct(rChanges.vsPrev || null)} | Día anterior: ${pct(rChanges.vsDay || null)}`;
+      colorizePctElem($('riesgoVar'), rChanges.vsPrev);
+    } else {
+      $('riesgoValor').textContent = 'No disponible';
+      $('riesgoVar').textContent = 'Variación: — | Día anterior: —';
+    }
+
+    // 3) GRÁFICO DÓLAR BLUE real: usar Bluelytics evolution.json (últimos días)
+    try{
+      const resHist = await fetch('https://api.bluelytics.com.ar/v2/evolution.json');
+      const hist = await resHist.json();
+      // hist es array de objetos con {date, blue: {value_buy, value_sell}, ...}
+      // Tomamos últimos 15 días y la venta
+      const ult = (Array.isArray(hist) ? hist.slice(-15) : []).map(d => ({
+        date: d.date,
+        sell: (d.blue && d.blue.value_sell) ? Number(d.blue.value_sell) : null
+      })).filter(x=>x.sell!==null);
+
+      const labels = ult.map(x => new Date(x.date).toLocaleDateString('es-AR'));
+      const data = ult.map(x => x.sell);
+
+      if (chartBlue) chartBlue.destroy();
+      const ctx = document.getElementById('chartBlue').getContext('2d');
+      chartBlue = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [{
+            label: 'Dólar Blue (venta)',
+            data,
+            borderColor: '#00796b',
+            backgroundColor: 'rgba(0,150,136,0.08)',
+            fill: true,
+            tension: 0.2,
+            pointRadius: 3
+          }]
+        },
+        options: { responsive:true, plugins:{legend:{display:false}}, scales:{ y:{ beginAtZero:false } } }
+      });
+    }catch(e){
+      console.warn('no se pudo cargar histórico Bluelytics', e);
+    }
+
+    // 4) Mostrar timestamp
+    $('lastUpdate').textContent = 'Última actualización: ' + new Date().toLocaleString('es-AR');
+
+  }catch(error){
+    console.error('Error en actualización:', error);
+  }
+}
+
+/* Ejecutar al cargar y cada hora */
+actualizarTodo();
+setInterval(actualizarTodo, 3600000); // 1 hora
+
+</script>
+</body>
+</html>
